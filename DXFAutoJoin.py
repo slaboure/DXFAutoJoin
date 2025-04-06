@@ -542,7 +542,7 @@ if __name__ == "__main__":
         output_file = sys.argv[2]
     else:
         base_name, ext = os.path.splitext(input_file)
-        output_file = f"{base_name}-auto-bound{ext}"
+        output_file = f"{base_name}-processed{ext}"
 
     # Parse tolerance or use default
     if len(sys.argv) > 3:

@@ -19,6 +19,7 @@
 import math
 import ezdxf
 from ezdxf.math import Vec2
+import re
 
 def distance_2d(p1, p2):
     """Euclidean distance in 2D."""
@@ -323,6 +324,68 @@ def chain_lines(lines):
 
     return polylines
 
+def approximate_arc(arc, num_segments=20):
+    """
+    Approximate an arc as a series of line segments.
+    """
+    center = arc["center"]
+    radius = arc["radius"]
+    start_angle = arc["start_angle"]
+    end_angle = arc["end_angle"]
+
+    # Generate points along the arc
+    points = []
+    for i in range(num_segments + 1):
+        angle = start_angle + i * (end_angle - start_angle) / num_segments
+        points.append(point_on_arc(center, radius, angle))
+
+    # Convert points to line segments
+    segments = []
+    for i in range(len(points) - 1):
+        segments.append({"start": points[i], "end": points[i + 1], "handle": arc["handle"]})
+    return segments
+
+def is_point_in_polygon(point, polygon):
+    """
+    Use the ray-casting algorithm to determine if a point is inside a polygon.
+    """
+    x, y = point
+    inside = False
+
+    for i in range(len(polygon)):
+        x1, y1 = polygon[i]["start"]
+        x2, y2 = polygon[i]["end"]
+
+        # Check if the point is within the y-range of the edge
+        if (y1 > y) != (y2 > y):
+            # Compute the x-coordinate of the intersection of the edge with the ray
+            x_intersect = x1 + (y - y1) * (x2 - x1) / (y2 - y1)
+            if x < x_intersect:
+                inside = not inside
+
+    return inside
+
+def is_polygon_in_polygon(inner_polygon, outer_polygon):
+    """
+    Check if all points of `inner_polygon` are inside `outer_polygon`.
+    """
+    for segment in inner_polygon:
+        if not is_point_in_polygon(segment["start"], outer_polygon):
+            return False
+        if not is_point_in_polygon(segment["end"], outer_polygon):
+            return False
+    return True
+
+def extract_numeric_layer_name(layer_name):
+    """
+    Extract all digits from the layer name and return them as a single integer.
+    If no digits are found, return 0.
+    """
+    digits = re.findall(r'\d+', layer_name)  # Find all numeric parts
+    if digits:
+        return int(''.join(digits))  # Combine and convert to an integer
+    return 0
+
 def unify_to_layers_in_place(input_dxf, output_dxf, tolerance=0.01):
     """
     Modify the existing DXF model to:
@@ -350,6 +413,7 @@ def unify_to_layers_in_place(input_dxf, output_dxf, tolerance=0.01):
     groups = find_connected_groups(entities)
 
     # 4) Modify the existing modelspace
+    polygons = []  # Store all polygons for containment checks
     for i, group in enumerate(groups):
         # Build a list of entity dicts for that group
         group_ents = [entities[idx] for idx in group]
@@ -365,16 +429,21 @@ def unify_to_layers_in_place(input_dxf, output_dxf, tolerance=0.01):
         if not doc_in.layers.has_entry(layer_name):
             doc_in.layers.new(name=layer_name)
 
+        polygon = []
         # 5) Add joined polylines for lines and remove original lines
         line_polylines = chain_lines(lines)  # each is a list of (x, y)
         for poly_pts in line_polylines:
             if len(poly_pts) < 2:
                 continue
-            msp_in.add_lwpolyline(
+            new_polyline = msp_in.add_lwpolyline(
                 points=poly_pts,
                 format="xy",
                 dxfattribs={"layer": layer_name}
             )
+            # Store the handle of the new polyline
+            for i in range(len(poly_pts) - 1):
+                # Store the start and end points of the polyline
+                polygon.append({"start": poly_pts[i], "end": poly_pts[i+1], "handle": new_polyline.dxf.handle})
 
         # Remove original lines from the modelspace
         for line in lines:
@@ -391,18 +460,66 @@ def unify_to_layers_in_place(input_dxf, output_dxf, tolerance=0.01):
                 # Move the original arc to the new layer
                 original_arc.dxf.layer = layer_name
 
-    # 7) Assign circles to a separate layer
+        # Approximate arcs as line segments and store the polygon
+        for ent in group_ents:
+            if ent["type"] == "ARC":
+                polygon.extend(approximate_arc(ent))
+        polygons.append((polygon, layer_name))
+
+    # 7) Check for polygon containment
+    for i, (inner_polygon, inner_layer) in enumerate(polygons):
+        for j, (outer_polygon, outer_layer) in enumerate(polygons):
+            if i != j and is_polygon_in_polygon(inner_polygon, outer_polygon):
+                # Update the layer name for the contained polygon
+                new_layer_name = f"{outer_layer} - Contained"
+                if not doc_in.layers.has_entry(new_layer_name):
+                    doc_in.layers.new(name=new_layer_name)
+
+                # Update the layer of all entities in the contained polygon
+                for segment in inner_polygon:
+                    handle = segment["handle"]
+                    original_entity = doc_in.entitydb.get(handle)
+                    if original_entity:
+                        original_entity.dxf.layer = new_layer_name
+
+    # 8) Assign circles to a separate layer or check if they are inside a closed polygon
     circle_layer_name = "Individual Circles"
     if not doc_in.layers.has_entry(circle_layer_name):
         doc_in.layers.new(name=circle_layer_name)
 
     for circle in msp_in.query("CIRCLE"):
+        center = (circle.dxf.center.x, circle.dxf.center.y)
+        radius = circle.dxf.radius
+
+        # Check if the circle is inside any closed polygon
+        inside_polygon = False
+        for polygon, layer_name in polygons:
+            if is_point_in_polygon(center, polygon):
+                wrapping_handle = polygon[0]["handle"]  # Use the handle of the first segment as the layer name
+                wrapping_entity = doc_in.entitydb.get(wrapping_handle)
+                if wrapping_entity:
+                    circle_layer_name = f"{wrapping_entity.dxf.layer} - Contained"
+                # circle_layer_name = f"Part {i+1} - Inside Circles"
+                break
+
+        # Assign the circle to the appropriate layer
         circle.dxf.layer = circle_layer_name
 
-    # 8) Save the modified DXF to a new file
+    # 9) Sort entities by numeric layer name before saving
+    # Extract all entities from the modelspace
+    entities = msp_in.query("*")
+
+    # Update the redraw order based on the sorted entities
+    msp_in.set_redraw_order(
+        (entity.dxf.handle, 10000 - extract_numeric_layer_name(entity.dxf.layer) ) 
+        for entity in entities)
+
+
+    # 10) Save the modified DXF to a new file
     doc_in.saveas(output_dxf)
     print(f"Done. Connected geometry grouped into layers in the existing model.")
     print(f"Wrote: {output_dxf}")
+    
 
 import sys
 

@@ -57,7 +57,7 @@ def extract_entities(msp):
     """
     Return a list of entities with a uniform data structure:
       {
-        'type': 'LINE' or 'ARC',
+        'type': 'LINE', 'ARC', or 'SPLINE',
         'start': (x1, y1),
         'end':   (x2, y2),
         'handle': 'entity_handle',  # Unique Handle ID
@@ -102,6 +102,18 @@ def extract_entities(msp):
             "start": arc_start,
             "end": arc_end,
             "handle": arc.dxf.handle,  # Track Handle ID
+        })
+
+    # Splines
+    for spline in msp.query("SPLINE"):
+        # Use the start and end points of the spline
+        start = tuple(spline.control_points[0])  # First control point
+        end = tuple(spline.control_points[-1])  # Last control point
+        result.append({
+            "type": "SPLINE",
+            "start": start,
+            "end": end,
+            "handle": spline.dxf.handle,  # Track Handle ID
         })
 
     return result
@@ -418,13 +430,14 @@ def unify_to_layers_in_place(input_dxf, output_dxf, tolerance=0.01):
         # Build a list of entity dicts for that group
         group_ents = [entities[idx] for idx in group]
 
-        # Separate lines vs arcs
+        # Separate lines, arcs, and splines
         lines = [e for e in group_ents if e["type"] == "LINE"]
         arcs = [e for e in group_ents if e["type"] == "ARC"]
+        splines = [e for e in group_ents if e["type"] == "SPLINE"]
 
         # Create a unique layer for this group
         layer_name = f"Part {i+1}"
-        if arcs:
+        if arcs or splines:
             layer_name = f"{layer_name} - Join Manually!"
         if not doc_in.layers.has_entry(layer_name):
             doc_in.layers.new(name=layer_name)
@@ -442,7 +455,6 @@ def unify_to_layers_in_place(input_dxf, output_dxf, tolerance=0.01):
             )
             # Store the handle of the new polyline
             for i in range(len(poly_pts) - 1):
-                # Store the start and end points of the polyline
                 polygon.append({"start": poly_pts[i], "end": poly_pts[i+1], "handle": new_polyline.dxf.handle})
 
         # Remove original lines from the modelspace
@@ -451,6 +463,13 @@ def unify_to_layers_in_place(input_dxf, output_dxf, tolerance=0.01):
             original_entity = doc_in.entitydb.get(handle)
             if original_entity:
                 msp_in.delete_entity(original_entity)
+
+        # Assign splines to the new layer
+        for spline in splines:
+            handle = spline["handle"]
+            original_spline = doc_in.entitydb.get(handle)
+            if original_spline:
+                original_spline.dxf.layer = layer_name
 
         # 6) Update arcs to the new layer
         for arc in arcs:

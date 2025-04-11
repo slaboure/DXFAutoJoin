@@ -18,7 +18,6 @@
 
 import math
 import ezdxf
-from ezdxf.math import Vec2
 import re
 
 def distance_2d(p1, p2):
